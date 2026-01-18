@@ -222,6 +222,39 @@ where
             total_size,
         }
     }
+
+    // Performs garbage collection: removes unused containers.
+    pub fn start_gc(&mut self) {
+        let current_id = self.containers.len();
+        let mut marked: Vec<bool> = vec![false; current_id + 1];
+        self.index.iter().for_each(|(_, id)| {
+            marked[*id] = true;
+        });
+
+        let mut new_ids: HashMap<usize, usize> = self
+            .containers
+            .iter()
+            .enumerate()
+            .filter(|(id, _)| marked[*id])
+            .enumerate()
+            .map(|(new_id, (old_id, _))| (old_id, new_id))
+            .collect();
+        new_ids.insert(current_id, new_ids.len());
+
+        let mut id = 0;
+        self.containers.retain(|_| {
+            let r = marked[id];
+            id += 1;
+            r
+        });
+
+        self.index.iter_mut().for_each(|(_, v)| *v = new_ids[v]);
+    }
+
+    // Perform compaction: remove gaps between the used elements within the containers.
+    pub fn compact(&mut self) {
+        todo!("Compaction is not yet supported.")
+    }
 }
 
 impl<K, V> Default for ContainerDatabase<K, V>
@@ -400,5 +433,29 @@ mod container_database_tests {
 
         assert!(stats.total_containers >= 2);
         assert!(stats.total_size >= 90);
+    }
+
+    #[test]
+    fn test_gc() {
+        let config = ContainerConfig { max_size: 100 };
+        let mut db: ContainerDatabase<String, Vec<u8>> = ContainerDatabase::new(config);
+
+        for i in 0..100 {
+            let key = format!("key{}", i % 10);
+            let value = vec![i as u8; 60];
+            db.insert(key, value).unwrap();
+        }
+
+        let before_gc_stats = db.stats();
+        println!("Before GC stats: {:?}", before_gc_stats);
+
+        db.start_gc();
+
+        let after_gc_stats = db.stats();
+        println!("After GC stats: {:?}", after_gc_stats);
+
+        assert!(before_gc_stats.sealed_containers > 50);
+        assert!(after_gc_stats.sealed_containers < before_gc_stats.sealed_containers);
+        assert!(after_gc_stats.sealed_containers < 11);
     }
 }
