@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io;
 use std::time::{Duration, Instant};
 
-use crate::{ChunkHash, Data};
+use crate::{Data, Hash};
 
 use super::database::{Database, IterableDatabase};
 use super::storage::DataContainer;
@@ -29,9 +29,8 @@ use super::storage::DataContainer;
 /// 2. A target map, which contains `Key`-`Vec<u8>` pairs, where `Key` is a generic value determined by the implementation.
 ///    The way data is stored is determined by the target map implementation, the only information known to the scrubber is that
 ///    the target map implements [Database] trait. It should only be used for storage purposes and not contain any algorithm logic.
-pub trait Scrub<Hash: ChunkHash, B, Key, T>
+pub trait Scrub<B, Key, T>
 where
-    Hash: ChunkHash,
     B: IterableDatabase<Hash, DataContainer<Key>>,
     T: Database<Key, Vec<u8>>,
 {
@@ -58,10 +57,7 @@ where
     /// We should be able to iterate over the `database` to process all chunks we had stored before.
     /// The [IntoIterator] trait should be implemented for `database`, but it should not be a big concern, because the only structure that should be implemented
     /// for the algorithm is the scrubber itself. `database` should be considered a given entity, along with the `target_map`.
-    fn scrub<'a>(&mut self, database: &mut B, target_map: &mut T) -> io::Result<ScrubMeasurements>
-    where
-        Hash: 'a,
-        Key: 'a;
+    fn scrub(&mut self, database: &mut B, target_map: &mut T) -> io::Result<ScrubMeasurements>;
 }
 
 /// Measurements made by the scrubber.
@@ -109,16 +105,12 @@ pub struct ClusteringMeasurements {
 pub struct CopyScrubber;
 
 pub struct DumbScrubber;
-impl<Hash, B, T> Scrub<Hash, B, Hash, T> for CopyScrubber
+impl<B, T> Scrub<B, Hash, T> for CopyScrubber
 where
-    Hash: ChunkHash,
     B: IterableDatabase<Hash, DataContainer<Hash>>,
     T: Database<Hash, Vec<u8>>,
 {
-    fn scrub<'a>(&mut self, database: &mut B, target: &mut T) -> io::Result<ScrubMeasurements>
-    where
-        Hash: 'a,
-    {
+    fn scrub(&mut self, database: &mut B, target: &mut T) -> io::Result<ScrubMeasurements> {
         let mut total_cluster_size: usize = 0;
         let mut number_of_vertices_in_cluster = HashMap::new();
         let mut distance_to_other_clusters = HashMap::new();
@@ -130,7 +122,7 @@ where
         for (hash, container) in database.iterator_mut() {
             match container.extract() {
                 Data::Chunk(chunk) => {
-                    target.insert(hash.clone(), chunk.clone())?;
+                    target.insert(*hash, chunk.clone())?;
                     total_cluster_size += 1;
                     processed_data += chunk.len();
                     number_of_vertices_in_cluster.insert(total_cluster_size as u32, 1);
@@ -138,7 +130,7 @@ where
                 }
                 Data::TargetChunk(_) => (),
             }
-            container.make_target(vec![hash.clone()]);
+            container.make_target(vec![*hash]);
         }
 
         for i in 0..parent_vertices.len() {
@@ -174,17 +166,12 @@ where
     }
 }
 
-impl<Hash, B, Key, T> Scrub<Hash, B, Key, T> for DumbScrubber
+impl<B, Key, T> Scrub<B, Key, T> for DumbScrubber
 where
-    Hash: ChunkHash,
     B: IterableDatabase<Hash, DataContainer<Key>>,
     T: Database<Key, Vec<u8>>,
 {
-    fn scrub<'a>(&mut self, _database: &mut B, _target: &mut T) -> io::Result<ScrubMeasurements>
-    where
-        Hash: 'a,
-        Key: 'a,
-    {
+    fn scrub(&mut self, _database: &mut B, _target: &mut T) -> io::Result<ScrubMeasurements> {
         Ok(ScrubMeasurements::default())
     }
 }
@@ -195,13 +182,19 @@ mod tests {
     use crate::system::HashMap;
     use crate::DataContainer;
 
-    fn create_test_data() -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn make_hash(label: &[u8]) -> Hash {
+        let mut h = [0u8; 32];
+        h[..label.len()].copy_from_slice(label);
+        h
+    }
+
+    fn create_test_data() -> Vec<(Hash, Vec<u8>)> {
         vec![
-            (b"chunk1".to_vec(), b"content1".to_vec()),
-            (b"chunk2".to_vec(), b"content2".to_vec()),
-            (b"chunk3".to_vec(), b"content3".to_vec()),
-            (b"duplicate_chunk".to_vec(), b"same_content".to_vec()),
-            (b"another_duplicate".to_vec(), b"same_content".to_vec()),
+            (make_hash(b"chunk1"), b"content1".to_vec()),
+            (make_hash(b"chunk2"), b"content2".to_vec()),
+            (make_hash(b"chunk3"), b"content3".to_vec()),
+            (make_hash(b"duplicate_chunk"), b"same_content".to_vec()),
+            (make_hash(b"another_duplicate"), b"same_content".to_vec()),
         ]
     }
 
@@ -210,14 +203,14 @@ mod tests {
         let test_data = create_test_data();
         let mut total_data_size = 0;
 
-        let mut database: HashMap<Vec<u8>, DataContainer<Vec<u8>>> = HashMap::new();
+        let mut database: HashMap<Hash, DataContainer<Hash>> = HashMap::new();
         let test_data_len = test_data.len();
         for (hash, chunk) in test_data {
             total_data_size += chunk.len();
             database.insert(hash.clone(), DataContainer::from(chunk));
         }
 
-        let mut target_map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut target_map: HashMap<Hash, Vec<u8>> = HashMap::new();
         let mut scrubber = CopyScrubber;
         let scrub_report = scrubber.scrub(&mut database, &mut target_map).unwrap();
 
@@ -246,8 +239,8 @@ mod tests {
     #[test]
     fn scrub_should_handle_empty_database() {
         let mut scrubber = CopyScrubber;
-        let mut database: HashMap<Vec<u8>, DataContainer<Vec<u8>>> = HashMap::new();
-        let mut target_map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut database: HashMap<Hash, DataContainer<Hash>> = HashMap::new();
+        let mut target_map: HashMap<Hash, Vec<u8>> = HashMap::new();
 
         let scrub_report = scrubber.scrub(&mut database, &mut target_map).unwrap();
 
